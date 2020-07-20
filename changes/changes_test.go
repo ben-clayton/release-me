@@ -300,3 +300,30 @@ func TestValidateVersionOrder(t *testing.T) {
 		fmt.Errorf("Version 1.0.0 on line 8 is not greater than version 2.4.0 on line 10"),
 	})
 }
+
+func TestReleaseNotes(t *testing.T) {
+	c, err := changes.Read(devNotes)
+	if err != nil {
+		t.Errorf("changes.Read() returned error: %v", err)
+		return
+	}
+	for _, test := range []struct {
+		v     semver.Version
+		notes string
+	}{
+		{semver.Version{Major: 2, Minor: 2, Patch: 1, Flavor: "dev"}, `xxx
+Notes about the 2.2.1 patch release
+yyy`},
+		{semver.Version{Major: 2, Minor: 2}, `Notes about the 2.2.0 minor release`},
+		{semver.Version{Major: 2, Minor: 1}, `Notes about the 2.1.0 minor release`},
+		{semver.Version{Major: 2, Minor: 0}, `Notes about the 2.0.0 major release`},
+		{semver.Version{Major: 1, Minor: 0}, `Notes about the 1.0.0 major release`},
+	} {
+		notes, ok := c.ReleaseNotes(test.v)
+		if !ok {
+			t.Errorf("changes.ReleaseNotes() returned false for version %v", test.v)
+			continue
+		}
+		check(t, fmt.Sprintf("%v notes", test.v), notes, test.notes)
+	}
+}

@@ -80,6 +80,34 @@ func (c Content) String() string {
 	return strings.Join(c.lines, "\n")
 }
 
+// ReleaseNotes returns the release notes for the given version
+func (c Content) ReleaseNotes(v semver.Version) (string, bool) {
+	startLine, endLine := -1, -1
+loop:
+	for _, ver := range c.versions {
+		switch {
+		case startLine != -1:
+			endLine = ver.line - 1
+			break loop
+		case ver.Version == v:
+			startLine = ver.line
+		}
+	}
+	if startLine == -1 {
+		return "", false
+	}
+	for startLine < len(c.lines) && strings.TrimSpace(c.lines[startLine]) == "" {
+		startLine++
+	}
+	if endLine == -1 {
+		endLine = len(c.lines)
+	}
+	for endLine > startLine && strings.TrimSpace(c.lines[endLine-1]) == "" {
+		endLine--
+	}
+	return strings.Join(c.lines[startLine:endLine], "\n"), true
+}
+
 func (c version) String() string {
 	b := strings.Builder{}
 	b.WriteString(c.prefix)

@@ -260,9 +260,11 @@ func (a app) flowRepo(ctx context.Context, r repo, c *github.Client) error {
 	if err := r.fetchBranches(ctx, a.ui, c); err != nil {
 		return fmt.Errorf("Failed to fetch branches: %w", err)
 	}
-
 	if err := r.fetchTags(ctx, a.ui, c); err != nil {
 		return fmt.Errorf("Failed to fetch tags: %w", err)
+	}
+	if err := r.fetchReleases(ctx, a.ui, c); err != nil {
+		return fmt.Errorf("Failed to fetch releases: %w", err)
 	}
 
 	r.determineVersionStyle()
@@ -279,7 +281,7 @@ func (a app) flowRepo(ctx context.Context, r repo, c *github.Client) error {
 		}
 	}
 
-	if len(r.missingTags) > 0 || len(r.missingBranches) > 0 {
+	if len(r.missingTags) > 0 || len(r.missingBranches) > 0 || len(r.missingReleases) > 0 {
 		types := []string{}
 		if len(r.missingBranches) > 0 {
 			types = append(types, "branches")
@@ -287,13 +289,19 @@ func (a app) flowRepo(ctx context.Context, r repo, c *github.Client) error {
 		if len(r.missingTags) > 0 {
 			types = append(types, "tags")
 		}
+		if len(r.missingReleases) > 0 {
+			types = append(types, "releases")
+		}
 
-		missing := make([]string, 0, len(r.missingTags)+len(r.missingBranches))
+		missing := make([]string, 0, len(r.missingTags)+len(r.missingBranches)+len(r.missingReleases))
 		for _, v := range r.missingBranches.List() {
 			missing = append(missing, fmt.Sprintf("Release branch '%v' for release %v", r.branchNameForVersion(v), v))
 		}
 		for _, v := range r.missingTags.List() {
 			missing = append(missing, fmt.Sprintf("Release tag '%v'", r.tagNameForVersion(v)))
+		}
+		for _, v := range r.missingReleases.List() {
+			missing = append(missing, fmt.Sprintf("Release '%v'", r.releaseNameForVersion(v)))
 		}
 		ok, err := a.ui.ShowConfirmation("Missing release "+strings.Join(types, " and ")+" found:",
 			strings.Join(missing, "\n"), "Would you like to create these now?")
@@ -301,9 +309,43 @@ func (a app) flowRepo(ctx context.Context, r repo, c *github.Client) error {
 			return err
 		}
 		if ok {
-			if err := createMissingBranchesAndTags(r, a.ui, a.git, a.cred); err != nil {
-				return err
+			var numCreatedBranches, numCreatedTags, numCreatedReleases int
+			var errs []error
+			if len(r.missingBranches) > 0 || len(r.missingTags) > 0 {
+				nb, nt, e := createMissingBranchesAndTags(r, a.ui, a.git, a.cred)
+				numCreatedBranches, numCreatedTags = nb, nt
+				errs = append(errs, e...)
+
+				// Re-scan branches and tags to reflect updates.
+				if err := r.fetchBranches(ctx, a.ui, c); err != nil {
+					return fmt.Errorf("Failed to fetch branches: %w", err)
+				}
+				if err := r.fetchTags(ctx, a.ui, c); err != nil {
+					return fmt.Errorf("Failed to fetch tags: %w", err)
+				}
 			}
+			if len(r.missingReleases) > 0 && len(errs) == 0 {
+				n, e := createMissingReleases(ctx, r, a.ui, c)
+				numCreatedReleases = n
+				errs = append(errs, e...)
+			}
+
+			title := fmt.Sprintf("Created %v branches, %v tags and %v releases with %v errors",
+				numCreatedBranches, numCreatedTags, numCreatedReleases, len(errs))
+			body := []string{}
+			for _, err := range errs {
+				body = append(body, err.Error())
+			}
+			if c := len(r.missingBranches); c > 0 {
+				body = append(body, fmt.Sprintf("There are still %d release branches missing", c))
+			}
+			if c := len(r.missingTags); c > 0 {
+				body = append(body, fmt.Sprintf("There are still %d release tags missing", c))
+			}
+			if c := len(r.missingReleases); c > 0 {
+				body = append(body, fmt.Sprintf("There are still %d releases missing", c))
+			}
+			a.ui.ShowMessage(title, strings.Join(body, "\n"))
 			return errRestartFlow
 		}
 	}
@@ -321,7 +363,7 @@ func (a app) flowRepo(ctx context.Context, r repo, c *github.Client) error {
 
 	switch options[selection] {
 	case optCreateRelease:
-		return a.flowReleaseMenu(r)
+		return a.flowReleaseMenu(ctx, r, c)
 	case optQuit:
 		return nil
 	}
@@ -333,7 +375,7 @@ func (a app) flowRepo(ctx context.Context, r repo, c *github.Client) error {
 // - Asks the user for the main branch to release from, along with the release
 //   version.
 // - Calls doRelease() to perform the actual release.
-func (a app) flowReleaseMenu(r repo) error {
+func (a app) flowReleaseMenu(ctx context.Context, r repo, c *github.Client) error {
 	return a.ui.Enter("Create release", func() error {
 		mainBranchName := ""
 		releaseVer := semver.Version{}
@@ -378,7 +420,7 @@ func (a app) flowReleaseMenu(r repo) error {
 		if err != nil {
 			return err
 		}
-		if err := doRelease(r, a.ui, a.git, b, v, a.cred); err != nil {
+		if err := doRelease(ctx, r, a.ui, a.git, c, b, v, a.cred); err != nil {
 			return err
 		}
 		return nil
@@ -417,8 +459,8 @@ func saveAndCommit(g *git.Git, path string, content string, msg string) (git.Has
 // createMissingBranchesAndTags checks out the repo r to a temporary directory,
 // scans the CHANGES file for all missing release branches and tags, building
 // each and pushing them to the repo r.
-func createMissingBranchesAndTags(r repo, u ui.UI, g *git.Git, cred credentials) error {
-	return u.Enter("Create missing", func() error {
+func createMissingBranchesAndTags(r repo, u ui.UI, g *git.Git, cred credentials) (numCreatedBranches int, numCreatedTags int, errs []error) {
+	err := u.Enter("Create missing", func() error {
 		if r.mainBranch == nil {
 			return fmt.Errorf("Couldn't identifiy main branch")
 		}
@@ -428,8 +470,6 @@ func createMissingBranchesAndTags(r repo, u ui.UI, g *git.Git, cred credentials)
 			return fmt.Errorf("Failed to create temporary checkout directory at '%v'", wd)
 		}
 		defer os.RemoveAll(wd)
-
-		errs := []error{}
 
 		if err := u.WithStatus("Checking out repository...", func(ui.Status) error {
 			if err := g.CheckoutRemoteBranch(wd, r.url, r.mainBranch.name); err != nil {
@@ -482,8 +522,6 @@ func createMissingBranchesAndTags(r repo, u ui.UI, g *git.Git, cred credentials)
 			return err
 		}
 
-		numCreatedBranches, numCreatedTags := 0, 0
-
 		u.WithStatus(fmt.Sprintf("Creating %d missing release branches...", len(branchesToCreate)), func(ui.Status) error {
 			for _, vh := range branchesToCreate {
 				if err := createReleaseBranch(r, u, g, wd, vh.h, vh.v, cred); err == nil {
@@ -507,29 +545,61 @@ func createMissingBranchesAndTags(r repo, u ui.UI, g *git.Git, cred credentials)
 			}
 			return nil
 		})
-
-		title := fmt.Sprintf("Created %v branches, %v tags with %v errors", numCreatedBranches, numCreatedTags, len(errs))
-		body := []string{}
-		for _, err := range errs {
-			body = append(body, err.Error())
-		}
-		if c := len(r.missingBranches); c > 0 {
-			body = append(body, fmt.Sprintf("There are still %d release branches missing", c))
-		}
-		if c := len(r.missingTags); c > 0 {
-			body = append(body, fmt.Sprintf("There are still %d release tags missing", c))
-		}
-		u.ShowMessage(title, strings.Join(body, "\n"))
-
 		return nil
 	})
+	if err != nil {
+		errs = append(errs, err)
+	}
+	return numCreatedBranches, numCreatedTags, errs
+}
+
+// createMissingReleases creates all the missing GitHub releases for the repo r.
+func createMissingReleases(ctx context.Context, r repo, u ui.UI, c *github.Client) (numCreatedReleases int, errs []error) {
+	u.Enter("Create missing releases", func() error {
+		for version := range r.missingReleases {
+			if err := createRelease(ctx, r, u, c, version); err != nil {
+				errs = append(errs, err)
+			} else {
+				delete(r.missingReleases, version)
+				numCreatedReleases++
+			}
+		}
+		return nil
+	})
+	return numCreatedReleases, errs
+}
+
+// createRelease creates a GitHub release for the given version for the repo r.
+func createRelease(ctx context.Context, r repo, u ui.UI, c *github.Client, version semver.Version) error {
+	tagName := r.tagNameForVersion(version)
+	releaseName := r.releaseNameForVersion(version)
+	tag, ok := r.tags[tagName]
+	if !ok {
+		return fmt.Errorf("Failed to find release tag '%v'", tagName)
+	}
+	releaseNotes, ok := tag.changes.ReleaseNotes(version)
+	if !ok {
+		return fmt.Errorf("Failed to find release notes for version %v", version)
+	}
+	draft, prerelease := false, false
+	_, _, err := c.Repositories.CreateRelease(ctx, r.owner, r.name, &github.RepositoryRelease{
+		TagName:         &tagName,
+		TargetCommitish: &tag.sha,
+		Name:            &releaseName,
+		Body:            &releaseNotes,
+		Draft:           &draft,
+		Prerelease:      &prerelease})
+	if err != nil {
+		return fmt.Errorf("Failed to create release: %w", err)
+	}
+	return nil
 }
 
 // doRelease checks out the repo to a temporary directory, and creates or
 // updates the release branch and git tag for the release at from / v, and
 // updating the CHANGES file. The release branch, tag and updated CHANGES file
 // is pushed to the repo r.
-func doRelease(r repo, u ui.UI, g *git.Git, from *branch, v semver.Version, cred credentials) error {
+func doRelease(ctx context.Context, r repo, u ui.UI, g *git.Git, c *github.Client, from *branch, v semver.Version, cred credentials) error {
 	changes := *from.changes
 
 	// Sanity checks (should be caught by validation)
@@ -576,11 +646,17 @@ func doRelease(r repo, u ui.UI, g *git.Git, from *branch, v semver.Version, cred
 			return err
 		}
 
-		// Create release branch and tag
+		// Create release branch, tag and GitHub release.
 		if err := createReleaseBranch(r, u, g, wd, releaseHash, v, cred); err != nil {
 			return err
 		}
 		if err := createReleaseTag(r, u, g, wd, releaseHash, v, cred); err != nil {
+			return err
+		}
+		if err := r.fetchTags(ctx, u, c); err != nil { // Re-scan tags to reflect updates. Needed by createRelease()
+			return fmt.Errorf("Failed to fetch tags: %w", err)
+		}
+		if err := createRelease(ctx, r, u, c, v); err != nil {
 			return err
 		}
 
@@ -742,15 +818,17 @@ func (c credentials) askToSave(ui ui.UI, path string) {
 ////////////////////////////////////////////////////////////////////////////////
 
 type repo struct {
-	owner           string             // www.github.com/<owner>/<name>
-	name            string             // www.github.com/<owner>/<name>
-	url             string             // Git remote URL
-	mainBranch      *branch            // Pointer to the default git branch
-	versionStyle    semver.Style       // Style determined from existing branch / tags names
-	branches        map[string]*branch // Existing branches by name
-	tags            map[string]*tag    // Existing tags by name
-	missingBranches semver.Set         // Release branches mentioned in CHANGES, but missing
-	missingTags     semver.Set         // Release tags mentioned in CHANGES, but missing
+	owner           string              // www.github.com/<owner>/<name>
+	name            string              // www.github.com/<owner>/<name>
+	url             string              // Git remote URL
+	mainBranch      *branch             // Pointer to the default git branch
+	versionStyle    semver.Style        // Style determined from existing branch / tags names
+	branches        map[string]*branch  // Existing branches by name
+	tags            map[string]*tag     // Existing tags by name
+	releases        map[string]*release // Existing releases by name
+	missingBranches semver.Set          // Release branches mentioned in CHANGES, but missing
+	missingTags     semver.Set          // Release tags mentioned in CHANGES, but missing
+	missingReleases semver.Set          // Releases mentioned in CHANGES, but missing
 }
 
 type branch struct {
@@ -766,6 +844,11 @@ type tag struct {
 	name    string           // Tag name
 	sha     string           // Tag git hash
 	changes *changes.Content // Content of CHANGES file at sha
+}
+
+type release struct {
+	name string
+	tag  string
 }
 
 // fetchBranches retrieves all the branches of the repo r, populating the
@@ -841,8 +924,31 @@ func (r *repo) fetchTags(ctx context.Context, u ui.UI, c *github.Client) error {
 	})
 }
 
+// fetchTags retrieves all GitHub releases of the repo r, populating the
+// r.releases field.
+func (r *repo) fetchReleases(ctx context.Context, u ui.UI, c *github.Client) error {
+	return u.WithStatus("Fetching releases", func(ui.Status) error {
+		releases, _, err := c.Repositories.ListReleases(ctx, r.owner, r.name, nil)
+		if err != nil {
+			return fmt.Errorf("Failed to list tags for repository: %w", err)
+		}
+
+		r.releases = map[string]*release{}
+		for _, rel := range releases {
+			rel := &release{
+				name: rel.GetName(),
+				tag:  rel.GetTagName(),
+			}
+			r.releases[rel.name] = rel
+		}
+
+		return nil
+	})
+}
+
 // determineVersionStyle attempts to determine the style used to label release
-// branches and tags. If no style can be determined, these defaults are used:
+// branches, tags and releases. If no style can be determined, these defaults
+// are used:
 //   branch: "release-<major>.x.x"
 //   tag:    "release-<major>.<minor>.<patch>"
 func (r *repo) determineVersionStyle() {
@@ -856,6 +962,12 @@ func (r *repo) determineVersionStyle() {
 	}
 	for _, t := range r.tags {
 		if s := semver.ParseStyle(t.name); s != nil {
+			prefixUses[s.Prefix] = prefixUses[s.Prefix] + 1
+			usesPatch = !s.OmitPatch && usesPatch
+		}
+	}
+	for _, r := range r.releases {
+		if s := semver.ParseStyle(r.name); s != nil {
 			prefixUses[s.Prefix] = prefixUses[s.Prefix] + 1
 			usesPatch = !s.OmitPatch && usesPatch
 		}
@@ -926,6 +1038,7 @@ func (r *repo) validate(ctx context.Context, u ui.UI) ([]string, error) {
 
 	r.missingBranches = semver.Set{}
 	r.missingTags = semver.Set{}
+	r.missingReleases = semver.Set{}
 
 	for _, b := range r.branches {
 		isDevelopementBranch := r.mainBranch == b
@@ -943,6 +1056,10 @@ func (r *repo) validate(ctx context.Context, u ui.UI) ([]string, error) {
 				vTagName := r.tagNameForVersion(v)
 				if _, found := r.tags[vTagName]; !found {
 					r.missingTags.Add(v)
+				}
+				vReleaseName := r.releaseNameForVersion(v)
+				if _, found := r.releases[vReleaseName]; !found {
+					r.missingReleases.Add(v)
 				}
 			}
 		}
@@ -994,5 +1111,11 @@ func (r repo) branchNameForVersion(v semver.Version) string {
 // tagNameForVersion returns the style-formatted release tag name for the
 // version v.
 func (r repo) tagNameForVersion(v semver.Version) string {
+	return r.versionStyle.Format(v)
+}
+
+// releaseNameForVersion returns the style-formatted release name for the
+// version v.
+func (r repo) releaseNameForVersion(v semver.Version) string {
 	return r.versionStyle.Format(v)
 }
