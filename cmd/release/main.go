@@ -1028,7 +1028,14 @@ func (r *repo) fetchChanges(ctx context.Context, c *github.Client, u ui.UI, name
 // isChangesFile returns true if the file at p could be a CHANGES file.
 func isChangesFile(p string) bool {
 	dir, name := path.Split(p)
-	return dir == "" && strings.Contains(name, "CHANGES")
+	if dir == "" {
+		for _, n := range changes.FileNames {
+			if name == n {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // validate looks for and returns a list of problems found with the current

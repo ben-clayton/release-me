@@ -6,7 +6,7 @@ Tools for managing [semantic versioned](https://semver.org/) releases of GitHub 
 `release-me` is a tool that automates the process of maintaining release branches, tags and
 [GitHub releases](https://docs.github.com/en/enterprise/2.13/user/articles/creating-releases).
 
-The tool will detect missing branches release branches, tags and 
+The tool will detect missing branches release branches, tags and
 [GitHub releases](https://docs.github.com/en/enterprise/2.13/user/articles/creating-releases),
 offering to create them, and also provides a one-click process for creating a new release.
 
@@ -27,14 +27,14 @@ An example `CHANGES` file [can be seen here](https://github.com/KhronosGroup/SPI
 
 ```
 go get -u github.com/ben-clayton/release-me
-go run github.com/ben-clayton/release-me
+go run github.com/ben-clayton/release-me/cmd/release
 ```
 
 When you first run `release-me`, you'll be asked to enter your GitHub username and access
 token. [Create a token](https://github.com/settings/tokens) with the following permissions:
  - `read:packages, repo`
  - `write:discussion, write:packages`
- 
+
  You'll be offered to save these credentials to your home directory.
- 
+
  The tool will then guide you though the process of creating missing branches or creating a new release.

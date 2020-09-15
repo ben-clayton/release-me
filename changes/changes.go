@@ -17,12 +17,20 @@ package changes
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/ben-clayton/release-me/semver"
 )
+
+// FileNames lists the permitted file names for the CHANGES file.
+var FileNames = []string{
+	"CHANGES", "CHANGES.md",
+}
 
 // Content holds the parsed content of a CHANGES file.
 type Content struct {
@@ -43,6 +51,32 @@ var (
 	// changesVersionRE is the regular expression used to parse versions from a CHANGES file.
 	changesVersionRE = regexp.MustCompile(`^(#* *)((?:\w*-|v)?\d+\.\d+(?:\.\d+)?(?:-\w+)?)( *)(\d\d\d\d-\d\d-\d\d)? *$`)
 )
+
+// Load loads the CHANGES file from path. Path may be a full file path, or a
+// path to a project root directory containing the CHANGES file.
+func Load(path string) (*Content, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if fi.IsDir() {
+		for _, name := range FileNames {
+			file, err := ioutil.ReadFile(filepath.Join(path, name))
+			if err != nil {
+				continue
+			}
+			return Read(string(file))
+		}
+		return nil, fmt.Errorf("Failed to find CHANGES file at '%v'", path)
+	}
+
+	file, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("Couldn't open CHANGES file at %v: %w", path, err)
+	}
+	return Read(string(file))
+}
 
 // Read parses the content of the CHANGES file from body, returning a Content.
 func Read(body string) (*Content, error) {

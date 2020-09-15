@@ -112,6 +112,16 @@ func Parse(s string) (Version, error) {
 	return v, nil
 }
 
+// MustParse parses the Version from the string s, panicing if there's a parse
+// error.
+func MustParse(s string) Version {
+	v, err := Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
 // Set is a set of unique versions
 type Set map[Version]struct{}
 
